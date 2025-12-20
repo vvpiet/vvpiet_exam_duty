@@ -38,6 +38,25 @@ import datetime
 import os
 import subprocess
 import sys
+import json
+
+
+def save_attendance_state(att_map):
+    try:
+        with open("attendance_state.json", "w", encoding="utf-8") as f:
+            json.dump(att_map, f, ensure_ascii=False)
+    except Exception:
+        st.warning("Unable to persist attendance state to disk; attendance may be lost on refresh.")
+
+
+def load_attendance_state():
+    if os.path.exists("attendance_state.json"):
+        try:
+            with open("attendance_state.json", "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            return {}
+    return {}
 
 st.set_page_config(page_title="Exam Supervision Allotment", layout="wide")
 
@@ -45,16 +64,50 @@ st.title("Supervision Allotment and Duty Orders")
 
 st.sidebar.header("Staff / Upload")
 uploaded = st.sidebar.file_uploader("Upload staff CSV (must contain Name and Mail Id)", type=["csv"] )
-if uploaded is None:
-    default_path = os.path.join(os.getcwd(), "Staff List Uniform list (1).csv")
+
+# Persist uploaded staff CSV so it survives refreshes on the server
+PERSISTED_STAFF = os.path.join(os.getcwd(), "staff_uploaded.csv")
+if uploaded is not None:
     try:
-        staff_df = pd.read_csv(default_path, header=0)
+        # read bytes and persist to disk
+        b = uploaded.getvalue()
     except Exception:
-        staff_df = pd.DataFrame(columns=["Sr. No.", "Name of Supervisor", "Mail Id"])
+        try:
+            uploaded.seek(0)
+            b = uploaded.read()
+        except Exception:
+            b = None
+
+    if b:
+        try:
+            with open(PERSISTED_STAFF, "wb") as f:
+                f.write(b)
+        except Exception:
+            st.warning("Unable to persist uploaded staff CSV to disk; data may be lost on refresh.")
+
+    try:
+        staff_df = pd.read_csv(io.BytesIO(b), header=0)
+    except Exception:
+        try:
+            staff_df = pd.read_csv(uploaded, header=0)
+        except Exception:
+            staff_df = pd.DataFrame(columns=["Sr. No.", "Name of Supervisor", "Mail Id"])
 else:
-    staff_df = pd.read_csv(uploaded, header=0)
+    # If there is a previously uploaded staff file on disk, prefer it
+    if os.path.exists(PERSISTED_STAFF):
+        try:
+            staff_df = pd.read_csv(PERSISTED_STAFF, header=0)
+        except Exception:
+            staff_df = pd.DataFrame(columns=["Sr. No.", "Name of Supervisor", "Mail Id"])
+    else:
+        default_path = os.path.join(os.getcwd(), "Staff List Uniform list (1).csv")
+        try:
+            staff_df = pd.read_csv(default_path, header=0)
+        except Exception:
+            staff_df = pd.DataFrame(columns=["Sr. No.", "Name of Supervisor", "Mail Id"])
 
 st.sidebar.write(f"Loaded {len(staff_df)} supervisors")
+st.sidebar.info("Uploaded staff CSV is persisted to the app storage as 'staff_uploaded.csv' and attendance is auto-saved to 'attendance_state.json' so refresh won't lose data.")
 
 st.header("Exam Configuration")
 col1, col2 = st.columns(2)
@@ -428,8 +481,15 @@ if "schedule_df" in st.session_state:
     schedule_df = st.session_state["schedule_df"]
     dates = sorted(schedule_df["date"].unique())
     st.write("Mark attendance date-wise and session-wise. Selected = present; unselected = absent.")
+    # Load persisted attendance state if present
     if "attendance" not in st.session_state:
         st.session_state["attendance"] = {}
+        if os.path.exists("attendance_state.json"):
+            try:
+                with open("attendance_state.json", "r", encoding="utf-8") as f:
+                    st.session_state["attendance"] = json.load(f)
+            except Exception:
+                st.warning("Unable to load persisted attendance state; starting fresh.")
 
     for d in dates:
         st.subheader(d.strftime("%Y-%m-%d"))
@@ -472,6 +532,8 @@ if "schedule_df" in st.session_state:
             "Evening_present": present_e,
             "Evening_assigned": evening_assigned,
         }
+        # Auto-save attendance state to disk so refresh won't lose marks
+        save_attendance_state(st.session_state["attendance"])
 
         # Per-date save + memo generation button
         save_key = f"save_{d.strftime('%Y%m%d')}"
@@ -543,6 +605,8 @@ if "schedule_df" in st.session_state:
                     st.download_button(f"Download memo for {name} ({date_str})", data=memo_pdf, file_name=fname, mime="application/pdf")
                     generated += 1
 
+                # Persist attendance state and notify
+                save_attendance_state(st.session_state["attendance"])
                 st.success(f"Attendance saved for {date_str} and memos generated for {generated} supervisor(s). They are also available under 'Absence Memos'.")
 
     if st.button("Save attendance"):
@@ -564,6 +628,8 @@ if "schedule_df" in st.session_state:
                 per_rows.append({"Date": date_str, "Session": "Evening", "Name": name, "Present": (name in info["Evening_present"])})
             per_df = pd.DataFrame(per_rows)
             per_df.to_csv(f"attendance_{date_str}.csv", index=False)
+        # Persist attendance state JSON as well
+        save_attendance_state(st.session_state["attendance"])
         st.success("Attendance saved to attendance_detailed.csv and per-date files (attendance_YYYY-MM-DD.csv)")
 
     # Provide consolidated download (horizontal) with date-session columns
