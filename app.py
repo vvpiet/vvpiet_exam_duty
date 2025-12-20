@@ -2,6 +2,7 @@ import streamlit as st
 from scheduler import generate_exam_dates, generate_schedule, build_supervisor_table
 from pdf_utils import generate_duty_pdf, combine_pdfs_bytes, generate_combined_duty_pdf
 import inspect
+import importlib
 
 
 def _call_pdf_compat(func, supervisor_name, schedule_df, staff_df, start_date, end_date, exam_type, college_logo_bytes=None, uni_logo_bytes=None, sign_bytes=None):
@@ -529,7 +530,8 @@ if "schedule_df" in st.session_state:
                         from pdf_utils import generate_absence_memo
                         memo_pdf = _call_memo_compat(generate_absence_memo, name, absences, staff_df, None, None, sign_bytes)
                     except Exception:
-                        memo_pdf = _call_memo_compat(__import__("pdf_utils").pdf_utils.generate_absence_memo, name, absences, staff_df, None, None, sign_bytes)
+                        pdf_mod = importlib.import_module("pdf_utils")
+                        memo_pdf = _call_memo_compat(pdf_mod.generate_absence_memo, name, absences, staff_df, None, None, sign_bytes)
 
                     # Save memo to file if possible and provide a download
                     fname = f"Memo_{name.replace(' ', '_')}_{date_str}.pdf"
@@ -663,7 +665,8 @@ if "schedule_df" in st.session_state:
         for name, absences in st.session_state["absentee_map"].items():
             memo_pdf = None
             try:
-                memo_pdf = _call_memo_compat(__import__("pdf_utils").pdf_utils.generate_absence_memo, name, absences, staff_df, None, None, sign_bytes)
+                pdf_mod = importlib.import_module("pdf_utils")
+                memo_pdf = _call_memo_compat(pdf_mod.generate_absence_memo, name, absences, staff_df, None, None, sign_bytes)
             except Exception:
                 try:
                     from pdf_utils import generate_absence_memo
@@ -696,7 +699,8 @@ if "schedule_df" in st.session_state:
                     st.warning(f"No email for {name}")
                     continue
                 # generate memo pdf bytes
-                memo_pdf = _call_memo_compat(__import__("pdf_utils").pdf_utils.generate_absence_memo, name, st.session_state["absentee_map"][name], staff_df, None, None, sign_bytes)
+                pdf_mod = importlib.import_module("pdf_utils")
+                memo_pdf = _call_memo_compat(pdf_mod.generate_absence_memo, name, st.session_state["absentee_map"][name], staff_df, None, None, sign_bytes)
                 sent = send_email_with_attachment(email, memo_subject_input, "Please find attached your absence memo.", memo_pdf, f"Memo_{name}.pdf")
                 if sent:
                     st.success(f"Memo sent to {email}")
