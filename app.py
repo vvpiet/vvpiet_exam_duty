@@ -1,6 +1,35 @@
 import streamlit as st
 from scheduler import generate_exam_dates, generate_schedule, build_supervisor_table
 from pdf_utils import generate_duty_pdf, combine_pdfs_bytes, generate_combined_duty_pdf
+import inspect
+
+
+def _call_pdf_compat(func, supervisor_name, schedule_df, staff_df, start_date, end_date, exam_type, college_logo_bytes=None, uni_logo_bytes=None, sign_bytes=None):
+    """Call a PDF function (generate_duty_pdf or generate_combined_duty_pdf) with only the optional kwargs it supports.
+    This avoids TypeError when older deployed versions of pdf_utils have fewer parameters.
+    """
+    sig = inspect.signature(func)
+    supported = {}
+    if 'college_logo_bytes' in sig.parameters:
+        supported['college_logo_bytes'] = college_logo_bytes
+    if 'uni_logo_bytes' in sig.parameters:
+        supported['uni_logo_bytes'] = uni_logo_bytes
+    if 'sign_bytes' in sig.parameters:
+        supported['sign_bytes'] = sign_bytes
+    return func(supervisor_name, schedule_df, staff_df, start_date, end_date, exam_type, **supported)
+
+
+def _call_memo_compat(func, supervisor_name, absences, staff_df, college_logo_bytes=None, uni_logo_bytes=None, sign_bytes=None):
+    """Call a memo PDF function with only the optional kwargs it supports (backwards compatible)."""
+    sig = inspect.signature(func)
+    supported = {}
+    if 'college_logo_bytes' in sig.parameters:
+        supported['college_logo_bytes'] = college_logo_bytes
+    if 'uni_logo_bytes' in sig.parameters:
+        supported['uni_logo_bytes'] = uni_logo_bytes
+    if 'sign_bytes' in sig.parameters:
+        supported['sign_bytes'] = sign_bytes
+    return func(supervisor_name, absences, staff_df, **supported)
 from email_utils import send_email_with_attachment
 import pandas as pd
 import io
@@ -291,7 +320,8 @@ if st.button("Generate & Download PDF for selected"):
                             st.write(f"Attempt with {exe} returned code {rc}. Output:\n{out}")
 
             for name in sel:
-                pdf_bytes = generate_duty_pdf(name, schedule_df, staff_df, start_date, end_date, exam_type, college_logo_bytes, uni_logo_bytes, sign_bytes)
+                # Use compatibility wrapper to avoid errors if deployed pdf_utils has fewer optional args
+                pdf_bytes = _call_pdf_compat(generate_duty_pdf, name, schedule_df, staff_df, start_date, end_date, exam_type, college_logo_bytes, uni_logo_bytes, sign_bytes)
                 # Validate PDF has pages before appending
                 valid = True
                 try:
@@ -316,7 +346,7 @@ if st.button("Generate & Download PDF for selected"):
             if len(pdfs) > 1:
                 # Prefer direct combined PDF generator (avoids external mergers)
                 try:
-                    combined = generate_combined_duty_pdf(sel, schedule_df, staff_df, start_date, end_date, exam_type, college_logo_bytes, uni_logo_bytes, sign_bytes)
+                    combined = _call_pdf_compat(generate_combined_duty_pdf, sel, schedule_df, staff_df, start_date, end_date, exam_type, college_logo_bytes, uni_logo_bytes, sign_bytes)
                 except Exception as gen_e:
                     st.warning(f"Direct combined generator failed ({gen_e}), attempting to merge individual PDFs...")
                     try:
@@ -385,7 +415,7 @@ if st.button("Send emails to selected"):
                     st.warning(f"No email for {name}")
                     continue
 
-                pdf_bytes = generate_duty_pdf(name, schedule_df, staff_df, start_date, end_date, exam_type, college_logo_bytes, uni_logo_bytes)
+                pdf_bytes = _call_pdf_compat(generate_duty_pdf, name, schedule_df, staff_df, start_date, end_date, exam_type, college_logo_bytes, uni_logo_bytes, None)
                 sent = send_email_with_attachment(email, f"Duty Allotment - {name}", "Please find attached your duty allotment.", pdf_bytes, f"Duty_{name}.pdf")
                 if sent:
                     st.success(f"Email sent to {email}")
@@ -497,9 +527,9 @@ if "schedule_df" in st.session_state:
                     st.session_state["absentee_map"].setdefault(name, []).extend(absences)
                     try:
                         from pdf_utils import generate_absence_memo
-                        memo_pdf = generate_absence_memo(name, absences, staff_df, None, None, sign_bytes)
+                        memo_pdf = _call_memo_compat(generate_absence_memo, name, absences, staff_df, None, None, sign_bytes)
                     except Exception:
-                        memo_pdf = __import__("pdf_utils").pdf_utils.generate_absence_memo(name, absences, staff_df, None, None, sign_bytes)
+                        memo_pdf = _call_memo_compat(__import__("pdf_utils").pdf_utils.generate_absence_memo, name, absences, staff_df, None, None, sign_bytes)
 
                     # Save memo to file if possible and provide a download
                     fname = f"Memo_{name.replace(' ', '_')}_{date_str}.pdf"
@@ -633,11 +663,13 @@ if "schedule_df" in st.session_state:
         for name, absences in st.session_state["absentee_map"].items():
             memo_pdf = None
             try:
-                memo_pdf = __import__("pdf_utils").pdf_utils.generate_absence_memo(name, absences, staff_df, None, None, sign_bytes)
+                memo_pdf = _call_memo_compat(__import__("pdf_utils").pdf_utils.generate_absence_memo, name, absences, staff_df, None, None, sign_bytes)
             except Exception:
-                # Fallback call
-                from pdf_utils import generate_absence_memo
-                memo_pdf = generate_absence_memo(name, absences, staff_df, None, None, sign_bytes)
+                try:
+                    from pdf_utils import generate_absence_memo
+                    memo_pdf = _call_memo_compat(generate_absence_memo, name, absences, staff_df, None, None, sign_bytes)
+                except Exception:
+                    memo_pdf = None
             st.download_button(f"Download memo for {name}", data=memo_pdf, file_name=f"Memo_{name}.pdf", mime="application/pdf")
 
         memo_send_emails = st.multiselect("Select absentees to email memos", options=list(st.session_state["absentee_map"].keys()))
@@ -664,7 +696,7 @@ if "schedule_df" in st.session_state:
                     st.warning(f"No email for {name}")
                     continue
                 # generate memo pdf bytes
-                memo_pdf = generate_absence_memo(name, st.session_state["absentee_map"][name], staff_df, None, None, sign_bytes)
+                memo_pdf = _call_memo_compat(__import__("pdf_utils").pdf_utils.generate_absence_memo, name, st.session_state["absentee_map"][name], staff_df, None, None, sign_bytes)
                 sent = send_email_with_attachment(email, memo_subject_input, "Please find attached your absence memo.", memo_pdf, f"Memo_{name}.pdf")
                 if sent:
                     st.success(f"Memo sent to {email}")
