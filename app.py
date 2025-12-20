@@ -58,6 +58,38 @@ def load_attendance_state():
             return {}
     return {}
 
+
+def save_schedule_state(df, meta: dict):
+    try:
+        # Convert dates to ISO strings so JSON is safe
+        temp = df.copy()
+        if 'date' in temp.columns:
+            temp['date'] = temp['date'].apply(lambda d: d.isoformat() if not pd.isnull(d) else None)
+        records = temp.to_dict(orient='records')
+        payload = {'meta': meta, 'records': records}
+        with open('schedule_state.json', 'w', encoding='utf-8') as f:
+            json.dump(payload, f, ensure_ascii=False)
+    except Exception:
+        st.warning('Unable to persist schedule to disk; schedule may be lost on refresh.')
+
+
+def load_schedule_state():
+    if os.path.exists('schedule_state.json'):
+        try:
+            with open('schedule_state.json', 'r', encoding='utf-8') as f:
+                payload = json.load(f)
+            records = payload.get('records', [])
+            if not records:
+                return None, None
+            df = pd.DataFrame(records)
+            if 'date' in df.columns:
+                df['date'] = pd.to_datetime(df['date']).dt.date
+            meta = payload.get('meta', {})
+            return df, meta
+        except Exception:
+            return None, None
+    return None, None
+
 st.set_page_config(page_title="Exam Supervision Allotment", layout="wide")
 
 st.title("Supervision Allotment and Duty Orders")
@@ -108,6 +140,17 @@ else:
 
 st.sidebar.write(f"Loaded {len(staff_df)} supervisors")
 st.sidebar.info("Uploaded staff CSV is persisted to the app storage as 'staff_uploaded.csv' and attendance is auto-saved to 'attendance_state.json' so refresh won't lose data.")
+if st.sidebar.button("Clear persisted schedule"):
+    try:
+        if os.path.exists('schedule_state.json'):
+            os.remove('schedule_state.json')
+        if 'schedule_df' in st.session_state:
+            del st.session_state['schedule_df']
+        if 'schedule_meta' in st.session_state:
+            del st.session_state['schedule_meta']
+        st.sidebar.success('Persisted schedule cleared. You may need to re-generate the schedule.')
+    except Exception:
+        st.sidebar.error('Unable to remove persisted schedule file.')
 
 st.header("Exam Configuration")
 col1, col2 = st.columns(2)
@@ -167,10 +210,27 @@ uni_logo = st.file_uploader("University logo (right)", type=["png","jpg","jpeg"]
 college_logo_bytes = col_logo.read() if col_logo else None
 uni_logo_bytes = uni_logo.read() if uni_logo else None
 
+# Try to load a previously generated schedule so attendance is available without regenerating
+if 'schedule_df' not in st.session_state:
+    loaded_df, loaded_meta = load_schedule_state()
+    if loaded_df is not None:
+        st.session_state['schedule_df'] = loaded_df
+        st.session_state['schedule_meta'] = loaded_meta or {}
+        st.info('Loaded previously generated schedule from disk; Attendance Marking is populated.')
+
 if st.button("Generate Schedule"):
     exam_dates = generate_exam_dates(start_date, end_date, exclude_weekends, holidays)
     schedule_df = generate_schedule(exam_dates, blocks, special_blocks, staff_df)
     st.session_state["schedule_df"] = schedule_df
+    # Persist schedule and basic metadata to disk so it can be loaded on refresh
+    meta = {
+        'start_date': start_date.isoformat() if isinstance(start_date, (datetime.date, datetime.datetime)) else str(start_date),
+        'end_date': end_date.isoformat() if isinstance(end_date, (datetime.date, datetime.datetime)) else str(end_date),
+        'blocks': blocks,
+        'exam_type': exam_type,
+        'special_blocks': {d.isoformat(): b for d, b in special_blocks.items()} if special_blocks else {}
+    }
+    save_schedule_state(schedule_df, meta)
     st.success("Schedule generated and cached in session.")
 
 if "schedule_df" in st.session_state:
