@@ -13,7 +13,7 @@ def _is_winter(month: int) -> bool:
     # winter: Oct-Jan (10-1), summer: Mar-Jul (3-7)
     return month in [10,11,12,1]
 
-def generate_duty_pdf(supervisor_name: str, schedule_df, staff_df, start_date, end_date, exam_type: str, college_logo_bytes: Optional[bytes]=None, uni_logo_bytes: Optional[bytes]=None) -> bytes:
+def generate_duty_pdf(supervisor_name: str, schedule_df, staff_df, start_date, end_date, exam_type: str, college_logo_bytes: Optional[bytes]=None, uni_logo_bytes: Optional[bytes]=None, sign_bytes: Optional[bytes]=None) -> bytes:
     buf = io.BytesIO()
     # Use platypus SimpleDocTemplate so text and tables flow across A4 pages correctly
     doc = SimpleDocTemplate(buf, pagesize=A4, leftMargin=30, rightMargin=30, topMargin=40, bottomMargin=40)
@@ -120,8 +120,17 @@ def generate_duty_pdf(supervisor_name: str, schedule_df, staff_df, start_date, e
         story.append(Paragraph(li, normal))
         story.append(Spacer(1, 6))
 
-    # Signature
+    # Signature (image if provided)
     story.append(Spacer(1, 24))
+    if sign_bytes:
+        try:
+            sig = Image(io.BytesIO(sign_bytes), width=40*mm, height=20*mm)
+            # Right-align the signature image above the Office In charge lines
+            sig_tbl = Table([["", sig]], colWidths=[width - (40*mm) - 20, 40*mm])
+            sig_tbl.setStyle(TableStyle([('ALIGN', (1,0), (1,0), 'RIGHT'), ('VALIGN', (0,0), (-1,-1), 'MIDDLE')]))
+            story.append(sig_tbl)
+        except Exception:
+            pass
     story.append(Paragraph('Office In charge', ParagraphStyle('sig', parent=styles['Normal'], alignment=2)))
     story.append(Paragraph('VVPIET CENTER, SOLAPUR', ParagraphStyle('sig2', parent=styles['Normal'], alignment=2)))
 
@@ -131,7 +140,7 @@ def generate_duty_pdf(supervisor_name: str, schedule_df, staff_df, start_date, e
     return buf.read()
 
 
-def _build_story_for_supervisor(supervisor_name: str, schedule_df, staff_df, start_date, end_date, exam_type: str, college_logo_bytes: Optional[bytes]=None, uni_logo_bytes: Optional[bytes]=None):
+def _build_story_for_supervisor(supervisor_name: str, schedule_df, staff_df, start_date, end_date, exam_type: str, college_logo_bytes: Optional[bytes]=None, uni_logo_bytes: Optional[bytes]=None, sign_bytes: Optional[bytes]=None):
     """Return a list of flowables for a single supervisor's duty order (without building the PDF)."""
     styles = getSampleStyleSheet()
     normal = ParagraphStyle('Normal', parent=styles['Normal'], fontName='Helvetica', fontSize=10, leading=15)
@@ -205,21 +214,71 @@ def _build_story_for_supervisor(supervisor_name: str, schedule_df, staff_df, sta
         story.append(Paragraph(li, normal))
         story.append(Spacer(1, 6))
 
-    # Signature
+    # Signature (image if provided)
     story.append(Spacer(1, 24))
+    if sign_bytes:
+        try:
+            sig = Image(io.BytesIO(sign_bytes), width=40*mm, height=20*mm)
+            # Right-align the signature image above the Office In charge lines
+            sig_tbl = Table([["", sig]], colWidths=[width - (40*mm) - 20, 40*mm])
+            sig_tbl.setStyle(TableStyle([('ALIGN', (1,0), (1,0), 'RIGHT'), ('VALIGN', (0,0), (-1,-1), 'MIDDLE')]))
+            story.append(sig_tbl)
+        except Exception:
+            pass
     story.append(Paragraph('Office In charge', ParagraphStyle('sig', parent=getSampleStyleSheet()['Normal'], alignment=2)))
     story.append(Paragraph('VVPIET CENTER, SOLAPUR', ParagraphStyle('sig2', parent=getSampleStyleSheet()['Normal'], alignment=2)))
 
     return story
 
 
-def generate_combined_duty_pdf(supervisor_names: list, schedule_df, staff_df, start_date, end_date, exam_type: str, college_logo_bytes: Optional[bytes]=None, uni_logo_bytes: Optional[bytes]=None) -> bytes:
+def generate_absence_memo(supervisor_name: str, absences: list, staff_df, college_logo_bytes: Optional[bytes]=None, uni_logo_bytes: Optional[bytes]=None, sign_bytes: Optional[bytes]=None) -> bytes:
+    """Generate a short memo PDF for a supervisor listing absences. """
+    buf = io.BytesIO()
+    doc = SimpleDocTemplate(buf, pagesize=A4, leftMargin=30, rightMargin=30, topMargin=40, bottomMargin=40)
+    width, _ = A4
+    styles = getSampleStyleSheet()
+    normal = ParagraphStyle('Normal', parent=styles['Normal'], fontName='Helvetica', fontSize=10, leading=15)
+    heading = ParagraphStyle('Heading', parent=styles['Heading1'], alignment=1, fontName='Helvetica-Bold', fontSize=12)
+
+    story = []
+    # Header
+    center_html = '<font size="12"><b>DUTY ABSENCE MEMO</b></font>'
+    story.append(Paragraph(center_html, ParagraphStyle('center', parent=styles['Normal'], alignment=1)))
+    story.append(Spacer(1, 12))
+
+    # Body
+    date_lines = '<br/>'.join([f"- {d.strftime('%Y-%m-%d')} ({s})" for d, s in absences])
+    body = f"To,<br/><b>{supervisor_name}</b><br/><br/>This is to inform you that you were absent for invigilation duty on the following date(s)/session(s):<br/>{date_lines}<br/><br/>You are requested to explain the absence within one day and acknowledge receipt of this memo.<br/><br/>"
+    story.append(Paragraph(body, normal))
+    story.append(Spacer(1, 24))
+
+    # Signature image if provided
+    if sign_bytes:
+        try:
+            sig = Image(io.BytesIO(sign_bytes), width=40*mm, height=20*mm)
+            # Right-align the signature image above the Office In charge lines
+            sig_tbl = Table([["", sig]], colWidths=[width - (40*mm) - 20, 40*mm])
+            sig_tbl.setStyle(TableStyle([('ALIGN', (1,0), (1,0), 'RIGHT'), ('VALIGN', (0,0), (-1,-1), 'MIDDLE')]))
+            story.append(sig_tbl)
+        except Exception:
+            pass
+
+    story.append(Spacer(1, 12))
+    story.append(Paragraph('Office In charge', ParagraphStyle('sig', parent=styles['Normal'], alignment=2)))
+    story.append(Paragraph('VVPIET CENTER, SOLAPUR', ParagraphStyle('sig2', parent=styles['Normal'], alignment=2)))
+
+    doc.build(story)
+    buf.seek(0)
+    return buf.read()
+
+
+def generate_combined_duty_pdf(supervisor_names: list, schedule_df, staff_df, start_date, end_date, exam_type: str, college_logo_bytes: Optional[bytes]=None, uni_logo_bytes: Optional[bytes]=None, sign_bytes: Optional[bytes]=None) -> bytes:
     """Generate a single combined PDF containing duty orders for all supervisors in supervisor_names (each starts on a new page)."""
     buf = io.BytesIO()
     doc = SimpleDocTemplate(buf, pagesize=A4, leftMargin=30, rightMargin=30, topMargin=40, bottomMargin=40)
     story = []
     for i, name in enumerate(supervisor_names):
-        story.extend(_build_story_for_supervisor(name, schedule_df, staff_df, start_date, end_date, exam_type, college_logo_bytes, uni_logo_bytes))
+        story.extend(_build_story_for_supervisor(name, schedule_df, staff_df, start_date, end_date, exam_type, college_logo_bytes, uni_logo_bytes, sign_bytes))
         if i < len(supervisor_names) - 1:
             story.append(PageBreak())
     doc.build(story)

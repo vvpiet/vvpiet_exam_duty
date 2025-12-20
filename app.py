@@ -223,6 +223,17 @@ if "selected_supervisors" not in st.session_state:
 col_a, col_b = st.columns([3, 1])
 with col_a:
     sel = st.multiselect("Select supervisor(s) to generate duty allotment", options=names, key="selected_supervisors")
+    # Signature for PDFs: check default file sign.jpg, allow upload to override
+    default_sign_path = os.path.join(os.getcwd(), "sign.jpg")
+    default_sign_bytes = None
+    if os.path.exists(default_sign_path):
+        try:
+            with open(default_sign_path, "rb") as f:
+                default_sign_bytes = f.read()
+        except Exception:
+            default_sign_bytes = None
+    sign_file = st.file_uploader("Signature (sign.jpg) for PDFs (optional)", type=["jpg", "jpeg", "png"], key="sign_pdf")
+    sign_bytes = sign_file.read() if sign_file else default_sign_bytes
 with col_b:
     def _select_all():
         st.session_state["selected_supervisors"] = names
@@ -280,7 +291,7 @@ if st.button("Generate & Download PDF for selected"):
                             st.write(f"Attempt with {exe} returned code {rc}. Output:\n{out}")
 
             for name in sel:
-                pdf_bytes = generate_duty_pdf(name, schedule_df, staff_df, start_date, end_date, exam_type, college_logo_bytes, uni_logo_bytes)
+                pdf_bytes = generate_duty_pdf(name, schedule_df, staff_df, start_date, end_date, exam_type, college_logo_bytes, uni_logo_bytes, sign_bytes)
                 # Validate PDF has pages before appending
                 valid = True
                 try:
@@ -305,7 +316,7 @@ if st.button("Generate & Download PDF for selected"):
             if len(pdfs) > 1:
                 # Prefer direct combined PDF generator (avoids external mergers)
                 try:
-                    combined = generate_combined_duty_pdf(sel, schedule_df, staff_df, start_date, end_date, exam_type, college_logo_bytes, uni_logo_bytes)
+                    combined = generate_combined_duty_pdf(sel, schedule_df, staff_df, start_date, end_date, exam_type, college_logo_bytes, uni_logo_bytes, sign_bytes)
                 except Exception as gen_e:
                     st.warning(f"Direct combined generator failed ({gen_e}), attempting to merge individual PDFs...")
                     try:
@@ -383,17 +394,281 @@ if st.button("Send emails to selected"):
 
 st.header("Attendance Marking")
 if "schedule_df" in st.session_state:
-    # Build a list of supervisors that have any duty
-    assigned_lists = st.session_state["schedule_df"]["assigned"].tolist()
-    assigned_flat = sorted(set([n for lst in assigned_lists for n in lst]))
-    attendance = st.multiselect("Mark those who attended duty (select names)", options=assigned_flat)
+    schedule_df = st.session_state["schedule_df"]
+    dates = sorted(schedule_df["date"].unique())
+    st.write("Mark attendance date-wise and session-wise. Selected = present; unselected = absent.")
+    if "attendance" not in st.session_state:
+        st.session_state["attendance"] = {}
+
+    for d in dates:
+        st.subheader(d.strftime("%Y-%m-%d"))
+        morning = schedule_df[(schedule_df["date"] == d) & (schedule_df["session"] == "Morning")]
+        evening = schedule_df[(schedule_df["date"] == d) & (schedule_df["session"] == "Evening")]
+        morning_assigned = morning.iloc[0]["assigned"] if not morning.empty else []
+        evening_assigned = evening.iloc[0]["assigned"] if not evening.empty else []
+
+        col1, col2 = st.columns(2)
+        with col1:
+            st.markdown("**Morning (10.00 a.m. to 01.00 p.m.)**")
+            present_m = []
+            # show checkbox per assigned supervisor
+            for name in sorted(morning_assigned):
+                safe_key = f"att_{d.strftime('%Y%m%d')}_m_{name.replace(' ', '_')}"
+                prev = False
+                prev_info = st.session_state.get("attendance", {}).get(d.strftime("%Y-%m-%d"), {})
+                if prev_info:
+                    prev = name in prev_info.get("Morning_present", [])
+                checked = st.checkbox(name, value=prev, key=safe_key)
+                if checked:
+                    present_m.append(name)
+        with col2:
+            st.markdown("**Evening (02.00 p.m. to 05.00 p.m.)**")
+            present_e = []
+            for name in sorted(evening_assigned):
+                safe_key = f"att_{d.strftime('%Y%m%d')}_e_{name.replace(' ', '_')}"
+                prev = False
+                prev_info = st.session_state.get("attendance", {}).get(d.strftime("%Y-%m-%d"), {})
+                if prev_info:
+                    prev = name in prev_info.get("Evening_present", [])
+                checked = st.checkbox(name, value=prev, key=safe_key)
+                if checked:
+                    present_e.append(name)
+
+        # Persist attendance
+        st.session_state["attendance"][d.strftime("%Y-%m-%d")] = {
+            "Morning_present": present_m,
+            "Morning_assigned": morning_assigned,
+            "Evening_present": present_e,
+            "Evening_assigned": evening_assigned,
+        }
+
+        # Per-date save + memo generation button
+        save_key = f"save_{d.strftime('%Y%m%d')}"
+        if st.button(f"Save & generate memos for {d.strftime('%Y-%m-%d')}", key=save_key):
+            date_str = d.strftime("%Y-%m-%d")
+            info = st.session_state["attendance"][date_str]
+            # write per-date CSV
+            per_rows = []
+            for name in info["Morning_assigned"]:
+                per_rows.append({"Date": date_str, "Session": "Morning", "Name": name, "Present": (name in info["Morning_present"])})
+            for name in info["Evening_assigned"]:
+                per_rows.append({"Date": date_str, "Session": "Evening", "Name": name, "Present": (name in info["Evening_present"])})
+            per_df = pd.DataFrame(per_rows)
+            try:
+                per_df.to_csv(f"attendance_{date_str}.csv", index=False)
+            except Exception:
+                st.warning("Unable to write per-date CSV to disk; proceeding to generate memos in memory.")
+
+            # Build absentees for this date only
+            abs_map_date = {}
+            for name in info["Morning_assigned"]:
+                if name not in info["Morning_present"]:
+                    abs_map_date.setdefault(name, []).append((d, "Morning"))
+            for name in info["Evening_assigned"]:
+                if name not in info["Evening_present"]:
+                    abs_map_date.setdefault(name, []).append((d, "Evening"))
+
+            if not abs_map_date:
+                st.success(f"Attendance saved for {date_str}. No absentees found.")
+            else:
+                # Ensure global absentee map exists and merge
+                st.session_state.setdefault("absentee_map", {})
+
+                # Determine signature bytes (try uploaded memo signature first, then sign.jpg file)
+                sign_bytes = None
+                try:
+                    uploaded = st.session_state.get("sign_upload")
+                    if uploaded:
+                        sign_bytes = uploaded.read()
+                except Exception:
+                    sign_bytes = None
+                if not sign_bytes:
+                    default_sign_path = os.path.join(os.getcwd(), "sign.jpg")
+                    if os.path.exists(default_sign_path):
+                        try:
+                            with open(default_sign_path, "rb") as f:
+                                sign_bytes = f.read()
+                        except Exception:
+                            sign_bytes = None
+
+                # Generate memo PDFs for absent supervisors for this date and add to absentee_map
+                generated = 0
+                for name, absences in abs_map_date.items():
+                    st.session_state["absentee_map"].setdefault(name, []).extend(absences)
+                    try:
+                        from pdf_utils import generate_absence_memo
+                        memo_pdf = generate_absence_memo(name, absences, staff_df, None, None, sign_bytes)
+                    except Exception:
+                        memo_pdf = __import__("pdf_utils").pdf_utils.generate_absence_memo(name, absences, staff_df, None, None, sign_bytes)
+
+                    # Save memo to file if possible and provide a download
+                    fname = f"Memo_{name.replace(' ', '_')}_{date_str}.pdf"
+                    try:
+                        with open(fname, "wb") as f:
+                            f.write(memo_pdf)
+                    except Exception:
+                        pass
+                    st.download_button(f"Download memo for {name} ({date_str})", data=memo_pdf, file_name=fname, mime="application/pdf")
+                    generated += 1
+
+                st.success(f"Attendance saved for {date_str} and memos generated for {generated} supervisor(s). They are also available under 'Absence Memos'.")
+
     if st.button("Save attendance"):
-        st.session_state["attendance"] = attendance
-        # Optionally persist to a local file
-        try:
-            pd.DataFrame({"Name": attendance}).to_csv("attendance.csv", index=False)
-            st.success("Attendance saved (also written to attendance.csv)")
-        except Exception:
-            st.success("Attendance saved in session")
+        # Persist to CSV: one row per date-session-supervisor with status
+        rows = []
+        for date_str, info in st.session_state["attendance"].items():
+            for name in info["Morning_assigned"]:
+                rows.append({"Date": date_str, "Session": "Morning", "Name": name, "Present": (name in info["Morning_present"])})
+            for name in info["Evening_assigned"]:
+                rows.append({"Date": date_str, "Session": "Evening", "Name": name, "Present": (name in info["Evening_present"])})
+        df_att = pd.DataFrame(rows)
+        df_att.to_csv("attendance_detailed.csv", index=False)
+        # Also write per-date CSVs
+        for date_str, info in st.session_state["attendance"].items():
+            per_rows = []
+            for name in info["Morning_assigned"]:
+                per_rows.append({"Date": date_str, "Session": "Morning", "Name": name, "Present": (name in info["Morning_present"])})
+            for name in info["Evening_assigned"]:
+                per_rows.append({"Date": date_str, "Session": "Evening", "Name": name, "Present": (name in info["Evening_present"])})
+            per_df = pd.DataFrame(per_rows)
+            per_df.to_csv(f"attendance_{date_str}.csv", index=False)
+        st.success("Attendance saved to attendance_detailed.csv and per-date files (attendance_YYYY-MM-DD.csv)")
+
+    # Provide consolidated download (horizontal) with date-session columns
+    if 'attendance' in st.session_state and st.session_state['attendance']:
+        def consolidated_attendance_excel_bytes(att_map):
+            from openpyxl import Workbook
+            from openpyxl.styles import Alignment, Font
+            wb = Workbook()
+            ws = wb.active
+            ws.title = 'Consolidated Attendance'
+
+            # Collect all dates and names
+            dates = sorted(att_map.keys())
+            names = sorted({n for info in att_map.values() for n in info['Morning_assigned'] + info['Evening_assigned']})
+
+            # Header
+            headers = ['Name']
+            for d in dates:
+                headers.append(f"{d} Morning")
+                headers.append(f"{d} Evening")
+            headers.extend(['Total Assigned', 'Total Present', 'Total Absent'])
+            for ci, h in enumerate(headers, start=1):
+                cell = ws.cell(row=1, column=ci, value=h)
+                cell.font = Font(bold=True)
+                cell.alignment = Alignment(horizontal='center', vertical='center', wrap_text=True)
+
+            # Rows per name
+            for ri, name in enumerate(names, start=2):
+                ws.cell(row=ri, column=1, value=name)
+                total_assigned = 0
+                total_present = 0
+                col = 2
+                for d in dates:
+                    info = att_map.get(d, {})
+                    m_assigned = name in info.get('Morning_assigned', [])
+                    e_assigned = name in info.get('Evening_assigned', [])
+                    if m_assigned:
+                        total_assigned += 1
+                        present = name in info.get('Morning_present', [])
+                        if present:
+                            total_present += 1
+                        ws.cell(row=ri, column=col, value='P' if present else 'A')
+                    else:
+                        ws.cell(row=ri, column=col, value='')
+                    col += 1
+                    if e_assigned:
+                        total_assigned += 1
+                        present = name in info.get('Evening_present', [])
+                        if present:
+                            total_present += 1
+                        ws.cell(row=ri, column=col, value='P' if present else 'A')
+                    else:
+                        ws.cell(row=ri, column=col, value='')
+                    col += 1
+
+                ws.cell(row=ri, column=col, value=total_assigned)
+                ws.cell(row=ri, column=col+1, value=total_present)
+                ws.cell(row=ri, column=col+2, value=(total_assigned - total_present))
+
+            # Auto width
+            for i in range(1, ws.max_column+1):
+                ws.column_dimensions[ws.cell(row=1, column=i).column_letter].width = 18
+
+            bio = io.BytesIO()
+            wb.save(bio)
+            bio.seek(0)
+            return bio.read()
+
+        consolidated_bytes = consolidated_attendance_excel_bytes(st.session_state['attendance'])
+        st.download_button("Download consolidated attendance (Excel)", data=consolidated_bytes, file_name="Consolidated_Attendance.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
+    # Show option to generate memos for absentees
+    st.markdown("---")
+    st.subheader("Absence Memos")
+    memo_subject = st.text_input("Memo email subject", value=st.session_state.get("memo_subject", "Absence from invigilation duty"))
+    sign_file = st.file_uploader("Signature image (optional, used in memo and duty PDF)", type=["png","jpg","jpeg"], key="sign_upload")
+    sign_bytes = sign_file.read() if sign_file else None
+
+    if st.button("Generate memos for absentees"):
+        # Build list of absentees per supervisor
+        absentee_map = {}
+        for date_str, info in st.session_state["attendance"].items():
+            d = datetime.datetime.strptime(date_str, "%Y-%m-%d").date()
+            for name in info["Morning_assigned"]:
+                if name not in info["Morning_present"]:
+                    absentee_map.setdefault(name, []).append((d, "Morning"))
+            for name in info["Evening_assigned"]:
+                if name not in info["Evening_present"]:
+                    absentee_map.setdefault(name, []).append((d, "Evening"))
+
+        if not absentee_map:
+            st.success("No absentees found.")
+        else:
+            st.session_state["absentee_map"] = absentee_map
+            st.success(f"Generated memos for {len(absentee_map)} absent supervisor(s). You can download or email them below.")
+
+    # If memos exist, show downloads and email option
+    if "absentee_map" in st.session_state:
+        for name, absences in st.session_state["absentee_map"].items():
+            memo_pdf = None
+            try:
+                memo_pdf = __import__("pdf_utils").pdf_utils.generate_absence_memo(name, absences, staff_df, None, None, sign_bytes)
+            except Exception:
+                # Fallback call
+                from pdf_utils import generate_absence_memo
+                memo_pdf = generate_absence_memo(name, absences, staff_df, None, None, sign_bytes)
+            st.download_button(f"Download memo for {name}", data=memo_pdf, file_name=f"Memo_{name}.pdf", mime="application/pdf")
+
+        memo_send_emails = st.multiselect("Select absentees to email memos", options=list(st.session_state["absentee_map"].keys()))
+        memo_subject_input = st.text_input("Memo email subject (for sending)", value=memo_subject)
+        if st.button("Send memo emails to selected"):
+            for name in memo_send_emails:
+                # find email
+                matching = staff_df[staff_df.iloc[:,1].str.strip()==name]
+                if matching.empty:
+                    st.warning(f"No email for {name}")
+                    continue
+                # find email in row
+                row = matching.iloc[0]
+                email = None
+                for val in row.values:
+                    try:
+                        s = str(val)
+                        if "@" in s and "." in s:
+                            email = s.strip()
+                            break
+                    except Exception:
+                        continue
+                if not email:
+                    st.warning(f"No email for {name}")
+                    continue
+                # generate memo pdf bytes
+                memo_pdf = generate_absence_memo(name, st.session_state["absentee_map"][name], staff_df, None, None, sign_bytes)
+                sent = send_email_with_attachment(email, memo_subject_input, "Please find attached your absence memo.", memo_pdf, f"Memo_{name}.pdf")
+                if sent:
+                    st.success(f"Memo sent to {email}")
+                else:
+                    st.error(f"Failed to send memo to {email}")
 else:
     st.info("Generate schedule to mark attendance")
