@@ -39,6 +39,7 @@ import os
 import subprocess
 import sys
 import json
+import ast
 
 
 def save_attendance_state(att_map):
@@ -69,11 +70,39 @@ def save_schedule_state(df, meta: dict):
         payload = {'meta': meta, 'records': records}
         with open('schedule_state.json', 'w', encoding='utf-8') as f:
             json.dump(payload, f, ensure_ascii=False)
+        # Also save a pickle for more robust reloading (preserves lists, dtypes)
+        try:
+            df.to_pickle('schedule_state.pkl')
+            with open('schedule_meta.json', 'w', encoding='utf-8') as mf:
+                json.dump(meta, mf, ensure_ascii=False)
+        except Exception:
+            # non-fatal, JSON remains
+            pass
+        # Also write a CSV backup for easy manual restore/download
+        try:
+            df.to_csv('schedule_state.csv', index=False)
+        except Exception:
+            pass
     except Exception:
         st.warning('Unable to persist schedule to disk; schedule may be lost on refresh.')
 
 
 def load_schedule_state():
+    # Prefer pickle (more robust), fall back to JSON
+    if os.path.exists('schedule_state.pkl'):
+        try:
+            df = pd.read_pickle('schedule_state.pkl')
+            meta = {}
+            try:
+                with open('schedule_meta.json', 'r', encoding='utf-8') as mf:
+                    meta = json.load(mf)
+            except Exception:
+                meta = {}
+            return df, meta
+        except Exception:
+            # Try JSON fallback
+            pass
+
     if os.path.exists('schedule_state.json'):
         try:
             with open('schedule_state.json', 'r', encoding='utf-8') as f:
@@ -89,6 +118,130 @@ def load_schedule_state():
         except Exception:
             return None, None
     return None, None
+
+
+def ensure_schedule_schema(df):
+    """Ensure schedule DataFrame has required columns: 'date', 'session', 'assigned'.
+    Normalize column names (case-insensitive), convert dates to date objects and parse assigned lists when stored as strings.
+    Returns normalized df or None if it cannot be normalized.
+    """
+    if df is None or df.empty:
+        return None
+
+    df = df.copy()
+
+    # Normalize column names (case-insensitive mapping)
+    cols = {c.lower(): c for c in df.columns}
+    # date
+    if 'date' not in cols:
+        # try common variants
+        for candidate in ['Date', 'DATE']:
+            if candidate in df.columns:
+                df = df.rename(columns={candidate: 'date'})
+                cols['date'] = 'date'
+                break
+        # try any column whose lower() == 'date'
+        if 'date' not in cols:
+            for c in df.columns:
+                if c.strip().lower() == 'date':
+                    df = df.rename(columns={c: 'date'})
+                    cols['date'] = 'date'
+                    break
+
+    if 'date' in cols:
+        try:
+            df['date'] = pd.to_datetime(df['date'], errors='coerce').dt.date
+        except Exception:
+            pass
+    else:
+        return None
+
+    # session
+    if 'session' not in cols:
+        for c in df.columns:
+            if c.strip().lower() == 'session':
+                df = df.rename(columns={c: 'session'})
+                cols['session'] = 'session'
+                break
+    if 'session' not in cols:
+        # If session column missing, try to infer based on 'time' or create default
+        if 'time' in (c.lower() for c in df.columns):
+            for c in df.columns:
+                if c.lower() == 'time':
+                    df = df.rename(columns={c: 'session'})
+                    cols['session'] = 'session'
+                    break
+        else:
+            # Can't reliably infer session; bail
+            return None
+
+    # assigned
+    if 'assigned' not in cols:
+        for c in df.columns:
+            if c.strip().lower() == 'assigned':
+                df = df.rename(columns={c: 'assigned'})
+                cols['assigned'] = 'assigned'
+                break
+    if 'assigned' not in cols:
+        # maybe assignments were stored in a column like 'Assigned' or 'assigned_to'
+        for c in df.columns:
+            if 'assign' in c.strip().lower():
+                df = df.rename(columns={c: 'assigned'})
+                cols['assigned'] = 'assigned'
+                break
+
+    if 'assigned' in cols:
+        # Ensure assigned are lists; parse string reprs
+        def _parse_assigned(v):
+            if v is None:
+                return []
+            if isinstance(v, list):
+                return v
+            if isinstance(v, (float, int)) and pd.isna(v):
+                return []
+            if isinstance(v, str):
+                s = v.strip()
+                # try literal_eval for list-like strings
+                try:
+                    val = ast.literal_eval(s)
+                    if isinstance(val, list):
+                        return [str(x) for x in val]
+                except Exception:
+                    # fallback: comma separated
+                    if ',' in s:
+                        return [x.strip() for x in s.split(',') if x.strip()]
+                    if s == '':
+                        return []
+                    return [s]
+            return [v]
+
+        df['assigned'] = df['assigned'].apply(_parse_assigned)
+    else:
+        return None
+
+    return df
+
+
+def _map_common_schedule_columns(df):
+    """Try to map common column name variants to the expected schema keys."""
+    if df is None or df.empty:
+        return df
+    rename = {}
+    for c in df.columns:
+        lc = c.strip().lower()
+        if 'date' in lc or 'exam date' in lc or 'date of' in lc:
+            rename[c] = 'date'
+        elif lc in ('session', 'time', 'shift') or 'session' in lc or 'time' in lc or 'shift' in lc:
+            rename[c] = 'session'
+        elif 'assign' in lc or 'invigil' in lc or 'supervisor' in lc or 'name' in lc:
+            # careful: avoid renaming 'Name of Faculty' to 'assigned' incorrectly when schedule horizontal format is used; only map if column seems to contain multiple names
+            rename[c] = 'assigned'
+    if rename:
+        try:
+            return df.rename(columns=rename)
+        except Exception:
+            return df
+    return df
 
 st.set_page_config(page_title="Exam Supervision Allotment", layout="wide")
 
@@ -152,6 +305,29 @@ if st.sidebar.button("Clear persisted schedule"):
     except Exception:
         st.sidebar.error('Unable to remove persisted schedule file.')
 
+# Restore schedule from a local CSV backup if needed
+with st.sidebar.expander("Restore schedule from file"):
+    restore_file = st.file_uploader("Upload a schedule CSV to restore", type=["csv"], key="restore_schedule")
+    if restore_file is not None:
+        try:
+            df_restore = pd.read_csv(restore_file, header=0)
+            df_restore = _map_common_schedule_columns(df_restore)
+            # try to parse date column
+            if 'date' in df_restore.columns:
+                try:
+                    df_restore['date'] = pd.to_datetime(df_restore['date']).dt.date
+                except Exception:
+                    pass
+            norm = ensure_schedule_schema(df_restore)
+            if norm is None:
+                st.sidebar.error('Uploaded schedule appears malformed: required columns (date, session, assigned) not found or could not be parsed. Please fix the CSV and try again.')
+            else:
+                st.session_state['schedule_df'] = norm
+                save_schedule_state(norm, {'restored_from_upload': True, 'restored_at': datetime.datetime.now().isoformat()})
+                st.sidebar.success('Schedule restored into session and persisted.')
+        except Exception as e:
+            st.sidebar.error(f'Unable to restore schedule from uploaded file: {e}')
+
 st.header("Exam Configuration")
 col1, col2 = st.columns(2)
 with col1:
@@ -214,9 +390,38 @@ uni_logo_bytes = uni_logo.read() if uni_logo else None
 if 'schedule_df' not in st.session_state:
     loaded_df, loaded_meta = load_schedule_state()
     if loaded_df is not None:
-        st.session_state['schedule_df'] = loaded_df
-        st.session_state['schedule_meta'] = loaded_meta or {}
-        st.info('Loaded previously generated schedule from disk; Attendance Marking is populated.')
+        # Try auto-mapping common column variants before normalization
+        mapped = _map_common_schedule_columns(loaded_df)
+        norm = ensure_schedule_schema(mapped)
+        if norm is not None:
+            st.session_state['schedule_df'] = norm
+            st.session_state['schedule_meta'] = loaded_meta or {}
+            # mark source and timestamp for UI badge
+            st.session_state['schedule_loaded_from'] = 'disk'
+            # prefer meta timestamp if present, otherwise use file mtime
+            ts = None
+            try:
+                if loaded_meta and 'generated_at' in loaded_meta:
+                    ts = loaded_meta.get('generated_at')
+            except Exception:
+                ts = None
+            if not ts:
+                try:
+                    ts = datetime.datetime.fromtimestamp(os.path.getmtime('schedule_state.pkl' if os.path.exists('schedule_state.pkl') else 'schedule_state.json')).isoformat()
+                except Exception:
+                    ts = None
+            st.session_state['schedule_loaded_timestamp'] = ts
+            st.info('Loaded previously generated schedule from disk; Attendance Marking is populated.')
+        else:
+            st.warning("Found a persisted schedule but it appears malformed (missing required columns). Please restore from a CSV or regenerate the schedule.")
+        # make persisted schedule downloadable from sidebar for backup
+        try:
+            if os.path.exists('schedule_state.csv'):
+                with open('schedule_state.csv', 'rb') as f:
+                    csv_bytes = f.read()
+                st.sidebar.download_button('Download persisted schedule (CSV)', data=csv_bytes, file_name='schedule_state.csv', mime='text/csv')
+        except Exception:
+            pass
 
 if st.button("Generate Schedule"):
     exam_dates = generate_exam_dates(start_date, end_date, exclude_weekends, holidays)
@@ -231,6 +436,16 @@ if st.button("Generate Schedule"):
         'special_blocks': {d.isoformat(): b for d, b in special_blocks.items()} if special_blocks else {}
     }
     save_schedule_state(schedule_df, meta)
+    # Mark session as freshly generated (so badge shows)
+    st.session_state['schedule_loaded_from'] = 'generated'
+    st.session_state['schedule_loaded_timestamp'] = datetime.datetime.now().isoformat()
+    meta['generated_at'] = st.session_state['schedule_loaded_timestamp']
+    # update saved meta with timestamp
+    try:
+        with open('schedule_meta.json', 'w', encoding='utf-8') as mf:
+            json.dump(meta, mf, ensure_ascii=False)
+    except Exception:
+        pass
     st.success("Schedule generated and cached in session.")
 
 if "schedule_df" in st.session_state:
@@ -238,6 +453,12 @@ if "schedule_df" in st.session_state:
     st.dataframe(st.session_state["schedule_df"])
     # Offer Excel download in required horizontal format
     def schedule_to_excel_bytes(schedule_df):
+        # Defensive: normalize/validate incoming DataFrame schema
+        safe = ensure_schedule_schema(schedule_df)
+        if safe is None:
+            # Caller will display an error; return None to indicate failure
+            return None
+        schedule_df = safe
         # Build workbook with merged headers using openpyxl for precise formatting
         from openpyxl import Workbook
         from openpyxl.styles import Alignment, Font
@@ -351,10 +572,15 @@ if "schedule_df" in st.session_state:
         bio.seek(0)
         return bio.read()
 
-    horiz_bytes = schedule_to_excel_horizontal(st.session_state["schedule_df"])
-    if horiz_bytes is not None:
-        filename2 = f"Schedule_Horizontal_{start_date.strftime('%Y%m%d')}_to_{end_date.strftime('%Y%m%d')}.xlsx"
-        st.download_button("Download Schedule (Horizontal Excel)", data=horiz_bytes, file_name=filename2, mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+    # Defensive: ensure schedule has expected schema before generating Excel
+    safe_df = ensure_schedule_schema(st.session_state.get("schedule_df"))
+    if safe_df is None:
+        st.error("Schedule is malformed or missing required columns (e.g., 'date'). Please regenerate or restore a valid schedule.")
+    else:
+        horiz_bytes = schedule_to_excel_horizontal(safe_df)
+        if horiz_bytes is not None:
+            filename2 = f"Schedule_Horizontal_{start_date.strftime('%Y%m%d')}_to_{end_date.strftime('%Y%m%d')}.xlsx"
+            st.download_button("Download Schedule (Horizontal Excel)", data=horiz_bytes, file_name=filename2, mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 else:
     st.info("Generate a schedule to preview assignments.")
 
@@ -537,8 +763,31 @@ if st.button("Send emails to selected"):
                     st.error(f"Failed to send to {email}")
 
 st.header("Attendance Marking")
+# Small status badge showing whether schedule was loaded or freshly generated
+badge_text = None
+badge_state = st.session_state.get('schedule_loaded_from')
+badge_ts = st.session_state.get('schedule_loaded_timestamp')
+if badge_state == 'disk':
+    short_ts = badge_ts[:19] if badge_ts else 'unknown'
+    badge_text = f"✅ Loaded from disk ({short_ts})"
+elif badge_state == 'generated':
+    short_ts = badge_ts[:19] if badge_ts else 'now'
+    badge_text = f"🟢 Generated ({short_ts})"
+else:
+    badge_text = "⚠️ No schedule loaded"
+
+colx, coly = st.columns([8, 2])
+with colx:
+    pass
+with coly:
+    st.markdown(f"**Status:** {badge_text}")
+
 if "schedule_df" in st.session_state:
-    schedule_df = st.session_state["schedule_df"]
+    # Normalize and validate schedule before use
+    schedule_df = ensure_schedule_schema(st.session_state.get("schedule_df"))
+    if schedule_df is None:
+        st.error("Current schedule is malformed or missing required columns (date/session/assigned). Please restore a valid schedule or regenerate it.")
+        st.stop()
     dates = sorted(schedule_df["date"].unique())
     st.write("Mark attendance date-wise and session-wise. Selected = present; unselected = absent.")
     # Load persisted attendance state if present
@@ -691,6 +940,13 @@ if "schedule_df" in st.session_state:
         # Persist attendance state JSON as well
         save_attendance_state(st.session_state["attendance"])
         st.success("Attendance saved to attendance_detailed.csv and per-date files (attendance_YYYY-MM-DD.csv)")
+        # Also provide an explicit download backup of current attendance state
+        try:
+            with open('attendance_state.json', 'rb') as f:
+                b = f.read()
+            st.sidebar.download_button('Download attendance backup (JSON)', data=b, file_name='attendance_state.json', mime='application/json')
+        except Exception:
+            pass
 
     # Provide consolidated download (horizontal) with date-session columns
     if 'attendance' in st.session_state and st.session_state['attendance']:

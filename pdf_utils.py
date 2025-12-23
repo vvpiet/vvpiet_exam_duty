@@ -51,7 +51,7 @@ def generate_duty_pdf(supervisor_name: str, schedule_df, staff_df, start_date, e
         f'<font size="9">{season} Exam Regular And Supplementary ({now.year})</font><br/>'
         '<font size="12"><b>DUTY ALLOTMENT SHEET</b></font>'
     )
-    center_para = Paragraph(center_html, ParagraphStyle('center', parent=getSampleStyleSheet()['Normal'], alignment=1))
+    center_para = Paragraph(center_html, ParagraphStyle('center', parent=getSampleStyleSheet()['Normal'], alignment=1, leading=18))
 
     # Build a table for header to place left logo, centered text, right logo
     header_data = [
@@ -171,7 +171,7 @@ def _build_story_for_supervisor(supervisor_name: str, schedule_df, staff_df, sta
         f'<font size="9">{season} Exam Regular And Supplementary ({now.year})</font><br/>'
         '<font size="12"><b>DUTY ALLOTMENT SHEET</b></font>'
     )
-    center_para = Paragraph(center_html, ParagraphStyle('center', parent=getSampleStyleSheet()['Normal'], alignment=1))
+    center_para = Paragraph(center_html, ParagraphStyle('center', parent=getSampleStyleSheet()['Normal'], alignment=1, leading=18))
 
     header_data = [[left_img if left_img else '', center_para, right_img if right_img else '']]
     width, _ = A4
@@ -242,8 +242,16 @@ def generate_absence_memo(supervisor_name: str, absences: list, staff_df, colleg
 
     story = []
     # Header
+    # Top institution line (bold, centered)
+    inst_html = '<font size="12"><b>VVP Institute of Engineering and Technology, Solapur</b></font>'
+    story.append(Paragraph(inst_html, ParagraphStyle('inst', parent=styles['Normal'], alignment=1)))
+    story.append(Spacer(1, 6))
+
     center_html = '<font size="12"><b>DUTY ABSENCE MEMO</b></font>'
     story.append(Paragraph(center_html, ParagraphStyle('center', parent=styles['Normal'], alignment=1)))
+    # Add current date below the title (right aligned)
+    today = datetime.date.today()
+    story.append(Paragraph(today.strftime('%Y-%m-%d'), ParagraphStyle('date_right', parent=styles['Normal'], alignment=2, fontSize=9)))
     story.append(Spacer(1, 12))
 
     # Body
