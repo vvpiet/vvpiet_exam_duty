@@ -243,6 +243,109 @@ def _map_common_schedule_columns(df):
             return df
     return df
 
+
+def _resolve_duplicate_columns(df):
+    """Resolve duplicate column names by merging or selecting sensible values.
+    - 'assigned': combine multiple columns into a single list of names
+    - 'date': pick first non-null and coerce to date
+    - 'session': pick first non-null
+    For any other duplicated column, pick the first non-null value.
+    """
+    import collections
+    if df is None or df.empty:
+        return df
+
+    cols = list(df.columns)
+    lowered = [c.strip().lower() for c in cols]
+    groups = collections.defaultdict(list)
+    for orig, low in zip(cols, lowered):
+        groups[low].append(orig)
+
+    out = df.copy()
+    for low, originals in groups.items():
+        if len(originals) <= 1:
+            continue
+        # Merge depending on key
+        if low == 'assigned':
+            def merge_assigned(row):
+                vals = []
+                for c in originals:
+                    v = row.get(c)
+                    if pd.isna(v) or v is None:
+                        continue
+                    # reuse ensure_schedule_schema parsing logic (simple):
+                    if isinstance(v, list):
+                        vals.extend([str(x) for x in v])
+                    else:
+                        s = str(v).strip()
+                        if s.startswith('[') and s.endswith(']'):
+                            try:
+                                arr = ast.literal_eval(s)
+                                if isinstance(arr, list):
+                                    vals.extend([str(x) for x in arr])
+                                    continue
+                            except Exception:
+                                pass
+                        if ',' in s:
+                            vals.extend([x.strip() for x in s.split(',') if x.strip()])
+                        elif s:
+                            vals.append(s)
+                # unique preserve order
+                seen = set()
+                out_list = []
+                for x in vals:
+                    if x not in seen:
+                        seen.add(x)
+                        out_list.append(x)
+                return out_list
+
+            out['assigned'] = out.apply(merge_assigned, axis=1)
+        elif low == 'date':
+            # pick first non-null and coerce to date
+            def pick_date(row):
+                for c in originals:
+                    v = row.get(c)
+                    if pd.isna(v) or v is None or str(v).strip() == '':
+                        continue
+                    try:
+                        return pd.to_datetime(v).date()
+                    except Exception:
+                        continue
+                return None
+
+            out['date'] = out.apply(pick_date, axis=1)
+        elif low == 'session':
+            def pick_session(row):
+                for c in originals:
+                    v = row.get(c)
+                    if pd.isna(v) or v is None or str(v).strip() == '':
+                        continue
+                    return str(v).strip()
+                return None
+
+            out['session'] = out.apply(pick_session, axis=1)
+        else:
+            # generic: pick first non-null
+            def pick_first(row):
+                for c in originals:
+                    v = row.get(c)
+                    if pd.isna(v) or v is None or str(v).strip() == '':
+                        continue
+                    return v
+                return None
+
+            out[low] = out.apply(pick_first, axis=1)
+
+        # drop other original columns except the standardized one we created
+        for c in originals:
+            if c != low and c in out.columns:
+                try:
+                    out.drop(columns=[c], inplace=True)
+                except Exception:
+                    pass
+
+    return out
+
 st.set_page_config(page_title="Exam Supervision Allotment", layout="wide")
 
 st.title("Supervision Allotment and Duty Orders")
@@ -390,30 +493,63 @@ uni_logo_bytes = uni_logo.read() if uni_logo else None
 if 'schedule_df' not in st.session_state:
     loaded_df, loaded_meta = load_schedule_state()
     if loaded_df is not None:
-        # Try auto-mapping common column variants before normalization
+        # Try auto-mapping common column variants before normalization and resolve duplicates
         mapped = _map_common_schedule_columns(loaded_df)
-        norm = ensure_schedule_schema(mapped)
-        if norm is not None:
-            st.session_state['schedule_df'] = norm
-            st.session_state['schedule_meta'] = loaded_meta or {}
-            # mark source and timestamp for UI badge
-            st.session_state['schedule_loaded_from'] = 'disk'
-            # prefer meta timestamp if present, otherwise use file mtime
+        resolved = _resolve_duplicate_columns(mapped)
+
+        # Determine generated timestamp for staleness check
+        ts = None
+        try:
+            if loaded_meta and 'generated_at' in loaded_meta:
+                ts = loaded_meta.get('generated_at')
+        except Exception:
             ts = None
+        if not ts:
             try:
-                if loaded_meta and 'generated_at' in loaded_meta:
-                    ts = loaded_meta.get('generated_at')
+                ts = datetime.datetime.fromtimestamp(os.path.getmtime('schedule_state.pkl' if os.path.exists('schedule_state.pkl') else 'schedule_state.json')).isoformat()
             except Exception:
                 ts = None
-            if not ts:
-                try:
-                    ts = datetime.datetime.fromtimestamp(os.path.getmtime('schedule_state.pkl' if os.path.exists('schedule_state.pkl') else 'schedule_state.json')).isoformat()
-                except Exception:
-                    ts = None
+
+        # Stale handling: don't auto-load schedules older than TTL_DAYS unless user confirms
+        TTL_DAYS = 7
+        stale = False
+        if ts:
+            try:
+                ts_dt = datetime.datetime.fromisoformat(ts)
+                age_days = (datetime.datetime.now() - ts_dt).days
+                if age_days > TTL_DAYS:
+                    stale = True
+            except Exception:
+                stale = False
+
+        if stale:
+            # Store candidate in session and prompt user via sidebar
+            st.session_state['schedule_persisted_candidate_df'] = resolved
+            st.session_state['schedule_persisted_candidate_meta'] = loaded_meta or {}
+            st.session_state['schedule_loaded_from'] = 'disk_stale'
             st.session_state['schedule_loaded_timestamp'] = ts
-            st.info('Loaded previously generated schedule from disk; Attendance Marking is populated.')
+            st.sidebar.warning(f"A persisted schedule dated {ts[:19]} is older than {TTL_DAYS} days. You can Load it or Clear persisted schedule.")
+            if st.sidebar.button('Load persisted schedule (force)', key='load_persisted_force'):
+                norm = ensure_schedule_schema(resolved)
+                if norm is not None:
+                    st.session_state['schedule_df'] = norm
+                    st.session_state['schedule_meta'] = loaded_meta or {}
+                    st.session_state['schedule_loaded_from'] = 'disk'
+                    st.session_state['schedule_loaded_timestamp'] = ts
+                    st.sidebar.success('Persisted schedule loaded into session.')
+                else:
+                    st.sidebar.error('Persisted schedule looks malformed and could not be normalized.')
         else:
-            st.warning("Found a persisted schedule but it appears malformed (missing required columns). Please restore from a CSV or regenerate the schedule.")
+            norm = ensure_schedule_schema(resolved)
+            if norm is not None:
+                st.session_state['schedule_df'] = norm
+                st.session_state['schedule_meta'] = loaded_meta or {}
+                # mark source and timestamp for UI badge
+                st.session_state['schedule_loaded_from'] = 'disk'
+                st.session_state['schedule_loaded_timestamp'] = ts
+                st.info('Loaded previously generated schedule from disk; Attendance Marking is populated.')
+            else:
+                st.warning("Found a persisted schedule but it appears malformed (missing required columns). Please restore from a CSV or regenerate the schedule.")
         # make persisted schedule downloadable from sidebar for backup
         try:
             if os.path.exists('schedule_state.csv'):
