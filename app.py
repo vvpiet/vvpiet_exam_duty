@@ -255,13 +255,27 @@ def _resolve_duplicate_columns(df):
     if df is None or df.empty:
         return df
 
+    # First make duplicate column names unique by appending a suffix so we can address them individually
     cols = list(df.columns)
-    lowered = [c.strip().lower() for c in cols]
-    groups = collections.defaultdict(list)
-    for orig, low in zip(cols, lowered):
-        groups[low].append(orig)
+    seen = {}
+    unique_cols = []
+    for c in cols:
+        if c in seen:
+            seen[c] += 1
+            unique_cols.append(f"{c}__dup{seen[c]}")
+        else:
+            seen[c] = 0
+            unique_cols.append(c)
+    tmp = df.copy()
+    tmp.columns = unique_cols
 
-    out = df.copy()
+    # Group by base lowercased names (strip duplication suffix)
+    groups = collections.defaultdict(list)
+    for orig in tmp.columns:
+        base = orig.split('__dup')[0].strip().lower()
+        groups[base].append(orig)
+
+    out = tmp.copy()
     for low, originals in groups.items():
         if len(originals) <= 1:
             continue
@@ -415,6 +429,7 @@ with st.sidebar.expander("Restore schedule from file"):
         try:
             df_restore = pd.read_csv(restore_file, header=0)
             df_restore = _map_common_schedule_columns(df_restore)
+            df_restore = _resolve_duplicate_columns(df_restore)
             # try to parse date column
             if 'date' in df_restore.columns:
                 try:
@@ -585,8 +600,14 @@ if st.button("Generate Schedule"):
     st.success("Schedule generated and cached in session.")
 
 if "schedule_df" in st.session_state:
+    # Validate and normalize schedule before preview to avoid duplicate-column or missing-column errors
     st.subheader("Schedule Preview")
-    st.dataframe(st.session_state["schedule_df"])
+    preview_df = _resolve_duplicate_columns(st.session_state.get("schedule_df"))
+    preview_df = ensure_schedule_schema(preview_df)
+    if preview_df is None:
+        st.error("Current schedule is malformed. Please restore a valid schedule (use the Restore tool) or regenerate the schedule.")
+    else:
+        st.dataframe(preview_df)
     # Offer Excel download in required horizontal format
     def schedule_to_excel_bytes(schedule_df):
         # Defensive: normalize/validate incoming DataFrame schema
