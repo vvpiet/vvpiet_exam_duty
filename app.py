@@ -453,7 +453,7 @@ with col1:
     end_date = st.date_input("End of Examinations", datetime.date.today() + datetime.timedelta(days=7))
     exam_type = st.selectbox("Exam Type", ["Regular", "Supplementary"])
 with col2:
-    exclude_weekends = st.checkbox("Exclude Weekends (Sat/Sun)", value=True)
+    exclude_weekends = st.checkbox("Exclude Sundays (skip Sundays)", value=True)
     holiday_text = st.text_area("Holidays (comma separated YYYY-MM-DD)", help="Enter dates separated by commas")
     try:
         holidays = [datetime.datetime.strptime(d.strip(), "%Y-%m-%d").date() for d in holiday_text.split(",") if d.strip()]

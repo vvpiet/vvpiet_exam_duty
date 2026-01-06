@@ -6,7 +6,9 @@ def generate_exam_dates(start_date: datetime.date, end_date: datetime.date, excl
     dates = []
     cur = start_date
     while cur <= end_date:
-        if exclude_weekends and cur.weekday() >= 5:
+        # When exclude_weekends is True we skip Sundays only (weekday()==6).
+        # Historically we skipped Sat/Sun; user requested only Sundays be excluded.
+        if exclude_weekends and cur.weekday() == 6:
             cur += datetime.timedelta(days=1)
             continue
         if cur in holidays:
